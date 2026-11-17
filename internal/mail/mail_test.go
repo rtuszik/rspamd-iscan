@@ -2,9 +2,12 @@ package mail
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
+	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/fho/rspamd-iscan/internal/testutils/mail"
 )
@@ -85,5 +88,84 @@ func TestReplaceHeader(t *testing.T) {
 
 	if !bytes.Equal(result, []byte(expected)) {
 		t.Errorf("Got:\n%q\nExpected:\n%q\n", string(result), expected)
+	}
+}
+
+func TestAddHeadersEdgeCases(t *testing.T) {
+	const hdrs = "X: y\r\n"
+	longValue := strings.Repeat("a", 8000)
+	// "\r\n\r\n" starts at offset 4094, spanning a 4096 byte boundary
+	boundaryValue := strings.Repeat("a", 4094-len("A: "))
+
+	tests := []struct {
+		name     string
+		in       string
+		expected string
+	}{
+		{
+			name:     "crlf",
+			in:       "A: 1\r\nB: 2\r\n\r\nbody\r\n\r\nmore\r\n",
+			expected: "A: 1\r\nB: 2\r\nX: y\r\n\r\nbody\r\n\r\nmore\r\n",
+		},
+		{
+			name:     "bare lf",
+			in:       "A: 1\nB: 2\n\nbody\n\nmore\n",
+			expected: "A: 1\nB: 2\nX: y\n\nbody\n\nmore\n",
+		},
+		{
+			name:     "separator spans read buffer boundary",
+			in:       "A: " + boundaryValue + "\r\n\r\nbody\r\n",
+			expected: "A: " + boundaryValue + "\r\nX: y\r\n\r\nbody\r\n",
+		},
+		{
+			name:     "header line longer than read buffer",
+			in:       "A: " + longValue + "\r\n\r\nbody\r\n",
+			expected: "A: " + longValue + "\r\nX: y\r\n\r\nbody\r\n",
+		},
+		{
+			name:     "no body",
+			in:       "A: 1\r\nB: 2\r\n",
+			expected: "A: 1\r\nB: 2\r\nX: y\r\n",
+		},
+		{
+			name:     "no body unterminated last line",
+			in:       "A: 1\r\nB: 2",
+			expected: "A: 1\r\nB: 2\r\nX: y\r\n",
+		},
+		{
+			name:     "no body bare lf unterminated last line",
+			in:       "A: 1\nB: 2",
+			expected: "A: 1\nB: 2\nX: y\n",
+		},
+		{
+			name:     "empty",
+			in:       "",
+			expected: "X: y\r\n",
+		},
+		{
+			name:     "no headers",
+			in:       "\r\nbody\r\n",
+			expected: "X: y\r\n\r\nbody\r\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := addHeaders(strings.NewReader(tc.in), &out, []byte(hdrs))
+			AssertNoErr(t, err)
+
+			if out.String() != tc.expected {
+				t.Errorf("Got:\n%q\nExpected:\n%q\n", out.String(), tc.expected)
+			}
+		})
+	}
+}
+
+func TestAddHeadersReadError(t *testing.T) {
+	readErr := errors.New("read failed")
+	err := addHeaders(iotest.ErrReader(readErr), io.Discard, []byte("X: y\r\n"))
+	if !errors.Is(err, readErr) {
+		t.Fatalf("expected error wrapping %v, got: %v", readErr, err)
 	}
 }

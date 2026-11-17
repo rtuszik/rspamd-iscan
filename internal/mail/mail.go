@@ -100,55 +100,56 @@ func AddHeaders(path string, headers []byte) error {
 	return os.Rename(tmpfileFd.Name(), path)
 }
 
-// addHeaders reads an email from in, inserts the additional headers and writes
-// the result to out.
+// addHeaders inserts \r\n terminated hdrs before the header/body separator, or at
+// EOF if there is none. hdrs line endings follow the email (\r\n or bare \n).
 func addHeaders(in io.Reader, out io.Writer, hdrs []byte) error {
 	emailBr := bufio.NewReader(in)
 	tmpfileBw := bufio.NewWriter(out)
-
-	buf := make([]byte, 4096)
+	eol := []byte("\r\n")
 
 	for {
-		n, err := emailBr.Read(buf)
-		if err != nil {
-			if err == io.EOF { //nolint:errorlint // errors.Is unnecessary here
-				return errors.New("header end not found")
-			}
+		line, err := emailBr.ReadBytes('\n')
+		if err != nil && err != io.EOF {
 			return fmt.Errorf("reading email failed: %w", err)
 		}
 
-		idx := bytes.Index(buf[:n], []byte("\r\n\r\n"))
-		if idx != -1 {
-			// header end found, copy up to the delim
-			_, err = tmpfileBw.Write(buf[:idx])
-			if err != nil {
+		if bytes.HasSuffix(line, []byte("\r\n")) {
+			eol = []byte("\r\n")
+		} else if bytes.HasSuffix(line, []byte("\n")) {
+			eol = []byte("\n")
+		}
+
+		blank := isBlankLine(line)
+		if err == nil && !blank {
+			if _, err := tmpfileBw.Write(line); err != nil {
 				return fmt.Errorf("copying data failed: %w", err)
 			}
-
-			// +2 to skip the \r\n of the last header line, all
-			// lines in hdrs are already expected to be \r\n
-			// terminated
-			buf = buf[idx+2 : n]
-			break
+			continue
 		}
 
-		_, err = tmpfileBw.Write(buf[:n])
-		if err != nil {
-			return fmt.Errorf("copying data failed: %w", err)
+		var separator []byte
+		if blank {
+			separator = line
+		} else if len(line) > 0 {
+			if _, err := tmpfileBw.Write(line); err != nil {
+				return fmt.Errorf("copying data failed: %w", err)
+			}
+			if !bytes.HasSuffix(line, []byte("\n")) {
+				if _, err := tmpfileBw.Write(eol); err != nil {
+					return fmt.Errorf("writing failed: %w", err)
+				}
+			}
 		}
-	}
 
-	if _, err := tmpfileBw.Write([]byte("\r\n")); err != nil {
-		return fmt.Errorf("writing failed: %w", err)
-	}
+		if _, err := tmpfileBw.Write(bytes.ReplaceAll(hdrs, []byte("\r\n"), eol)); err != nil {
+			return fmt.Errorf("writing failed: %w", err)
+		}
 
-	if _, err := tmpfileBw.Write(hdrs); err != nil {
-		return fmt.Errorf("writing failed: %w", err)
-	}
+		if _, err := tmpfileBw.Write(separator); err != nil {
+			return fmt.Errorf("writing failed: %w", err)
+		}
 
-	// write remaining data from already read buffer
-	if _, err := tmpfileBw.Write(buf); err != nil {
-		return fmt.Errorf("writing failed: %w", err)
+		break
 	}
 
 	if _, err := io.Copy(tmpfileBw, emailBr); err != nil {
@@ -160,6 +161,10 @@ func addHeaders(in io.Reader, out io.Writer, hdrs []byte) error {
 	}
 
 	return nil
+}
+
+func isBlankLine(line []byte) bool {
+	return bytes.Equal(line, []byte("\r\n")) || bytes.Equal(line, []byte("\n"))
 }
 
 // ReplaceHeader replaces the first occurrence of a header in the e-mail at [path].
